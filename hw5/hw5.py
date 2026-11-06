@@ -1,6 +1,9 @@
 import os
+import sys
+import time
 import heapq
 from collections import deque
+from concurrent.futures import ProcessPoolExecutor
 from itertools import count
 import numpy as np
 from scipy import stats
@@ -18,11 +21,11 @@ Arrivals -> S1 -> S2 -> S3 -> S4 -> Good
 Time unit in the code: minutes.
 Arrivals: 125 parts/hr, interarrival ~ Exp(mean 1/125 * 60 min = 0.48 min = 28.8 sec)
 
-Station   capacity   service time (sec)     after service
-S1        1          U(10, 20)              fallout w.p. 0.15
-S2        1          Tria(20, 30, 40)       fallout w.p. 0.30
-S3        2          U(60, 84)              fallout w.p. 0.33
-S4        1          Exp(mean 40)           rework  w.p. 0.08 (back to S1), else good
+Station   capacity   service time (sec)     after service (base system)   part (e) system
+S1        1          U(10, 20)              fallout w.p. 0.15             0.10
+S2        1          Tria(20, 30, 40)       fallout w.p. 0.30             0.25
+S3        2          U(60, 84)              fallout w.p. 0.33             0.28
+S4        1          Exp(mean 40)           rework  w.p. 0.08 (to S1)     0.08
 (service times are divided by 60 in service_time() to convert seconds -> minutes)
 
 Fallouts are discarded.
@@ -37,11 +40,16 @@ Performance measures (steady state):
   U_i      utilization of S1..S4 (busy time / (capacity * elapsed time))
   good/hr  rate at which good parts are completed
   fall/hr  rate at which parts fall out at S1, S2, S3
+
+Random numbers: every replication j gets 9 separate streams (arrivals, service at S1..S4,
+routing at S1..S4) seeded from (seed, j, k). Running the base and the part (e) system with the
+same (seed, j) gives common random numbers, which is what makes the paired-t in (e)(iii) sharp.
 """
 
 INTERARRIVAL_MEAN = 60 / 125  # 0.48 min = 28.8 sec  (125 parts/hr)
 CAP = [1, 1, 2, 1]
-P = [0.15, 0.30, 0.33, 0.08]  # fallout prob at S1..S3, rework prob at S4
+P_BASE = [0.15, 0.30, 0.33, 0.08]  # fallout prob at S1..S3, rework prob at S4
+P_NEW = [0.10, 0.25, 0.28, 0.08]   # part (e): each fallout prob 5 percentage points lower
 
 
 def service_time(i, rng):
@@ -60,14 +68,13 @@ class Part:
         self.rework = False  # True once the part has been sent back from S4
 
 
-def make_streams(seed, n):
-    return [np.random.default_rng(s) for s in np.random.SeedSequence(seed).spawn(n)]
+def simulate(rep_seed, p, warmup_min, run_min, trace=False):
+    """One replication with routing probabilities p. Statistics are cleared at warmup_min and
+    collected for run_min more minutes. If trace is True, also returns the time-average number in
+    system for every minute from t = 0 (used for the Welch and run-length plots)."""
+    g = [np.random.default_rng([*rep_seed, k]) for k in range(9)]
+    arr_rng, svc_rng, route_rng = g[0], g[1:5], g[5:9]
 
-
-def simulate(rng, warmup_min, run_min, trace=None):
-    """One replication. Statistics are cleared at warmup_min and collected for run_min more minutes.
-    If trace is a list, the time-average number in system for every minute (from t = 0) is appended
-    to it (used for the Welch plot)."""
     warmup = warmup_min
     end = warmup + run_min
 
@@ -89,6 +96,7 @@ def simulate(rng, warmup_min, run_min, trace=None):
     # trace for the Welch plot (never cleared)
     area_N_total = 0.0
     last_tick_area = 0.0
+    tr = []
 
     events = []  # heap of (time, tie-breaker, type, station, part)
     seq = count()
@@ -98,7 +106,7 @@ def simulate(rng, warmup_min, run_min, trace=None):
 
     def start_service(i, part):
         busy[i] += 1
-        schedule(t + service_time(i, rng), "departure", i, part)
+        schedule(t + service_time(i, svc_rng[i]), "departure", i, part)
 
     def enter_station(i, part):
         if busy[i] < CAP[i]:
@@ -106,10 +114,10 @@ def simulate(rng, warmup_min, run_min, trace=None):
         else:
             queue[i].append(part)
 
-    schedule(rng.exponential(INTERARRIVAL_MEAN), "arrival", part=None)
+    schedule(arr_rng.exponential(INTERARRIVAL_MEAN), "arrival")
     schedule(warmup, "warmup")
     schedule(end, "end")
-    if trace is not None:
+    if trace:
         schedule(1.0, "tick")
 
     while events:
@@ -124,7 +132,7 @@ def simulate(rng, warmup_min, run_min, trace=None):
         t = time
 
         if kind == "arrival":
-            schedule(t + rng.exponential(INTERARRIVAL_MEAN), "arrival")
+            schedule(t + arr_rng.exponential(INTERARRIVAL_MEAN), "arrival")
             in_system += 1
             enter_station(0, Part(t))
 
@@ -133,13 +141,14 @@ def simulate(rng, warmup_min, run_min, trace=None):
             if queue[i]:
                 start_service(i, queue[i].popleft())
 
+            u = route_rng[i].random()
             leaves = False
-            if i < 3 and rng.random() < P[i]:  # fallout at S1, S2, S3
+            if i < 3 and u < p[i]:  # fallout at S1, S2, S3
                 fallouts[i] += 1
                 leaves = True
             elif i < 3:
                 enter_station(i + 1, part)
-            elif rng.random() < P[3]:  # rework from S4 -> back to S1
+            elif u < p[3]:  # rework from S4 -> back to S1
                 if not part.rework:  # count each part once, even if reworked again
                     part.rework = True
                     R += 1
@@ -167,7 +176,7 @@ def simulate(rng, warmup_min, run_min, trace=None):
             t_start = t
 
         elif kind == "tick":
-            trace.append(area_N_total - last_tick_area)  # 1-minute bin -> time-average
+            tr.append(area_N_total - last_tick_area)  # 1-minute bin -> time-average
             last_tick_area = area_N_total
             if t + 1 <= end:
                 schedule(t + 1, "tick")
@@ -177,7 +186,7 @@ def simulate(rng, warmup_min, run_min, trace=None):
 
     T = t - t_start  # minutes of data collection
     hrs = T / 60
-    return np.array([
+    out = np.array([
         area_N / T,                       # L
         maxR,                             # max parts in rework at once
         sum_time_all / n_left,            # W, all parts (min)
@@ -186,6 +195,23 @@ def simulate(rng, warmup_min, run_min, trace=None):
         completed / hrs,                  # good parts per hour
         *[f / hrs for f in fallouts],     # fallout rates S1..S3 per hour
     ])
+    if trace:
+        return out, np.array(tr)
+    return out
+
+
+def _rep(args):
+    return simulate(*args)
+
+
+def run_reps(pool, seed, n, p, warmup_min, run_min, trace=False):
+    """n independent replications (seeds (seed, 0), ..., (seed, n-1)), spread over all cores."""
+    jobs = [((seed, j), p, warmup_min, run_min, trace) for j in range(n)]
+    res = list(pool.map(_rep, jobs, chunksize=max(1, n // (4 * (os.cpu_count() or 1)))))
+    if trace:
+        m = min(len(tr) for _, tr in res)
+        return np.array([o for o, _ in res]), np.array([tr[:m] for _, tr in res])
+    return np.array(res)
 
 
 MEASURES = [
@@ -213,15 +239,24 @@ def ci(Y, alpha=0.05):
     return ybar, s, h
 
 
-def flow_rates():
+def flow_rates(p):
     """Traffic equations: long-run arrival rate (per min) into each station, and utilizations."""
     lam0 = 1 / INTERARRIVAL_MEAN
-    pass_to_S4 = (1 - P[0]) * (1 - P[1]) * (1 - P[2])
-    lam1 = lam0 / (1 - pass_to_S4 * P[3])  # external arrivals + rework
-    lam = [lam1, lam1 * (1 - P[0]), lam1 * (1 - P[0]) * (1 - P[1]), lam1 * pass_to_S4]
+    pass_to_S4 = (1 - p[0]) * (1 - p[1]) * (1 - p[2])
+    lam1 = lam0 / (1 - pass_to_S4 * p[3])  # external arrivals + rework
+    lam = [lam1, lam1 * (1 - p[0]), lam1 * (1 - p[0]) * (1 - p[1]), lam1 * pass_to_S4]
     means = [15 / 60, 30 / 60, 72 / 60, 40 / 60]  # mean service times in minutes
     rho = [lam[k] * means[k] / CAP[k] for k in range(4)]
     return np.array(lam), np.array(rho)
+
+
+def theory_column(p):
+    lam, rho = flow_rates(p)
+    theory = np.full(len(MEASURES), np.nan)
+    theory[4:8] = rho
+    theory[8] = 60 * lam[3] * (1 - p[3])
+    theory[9:12] = 60 * lam[:3] * np.array(p[:3])
+    return lam, rho, theory
 
 
 def welch_moving_average(Ybar, w):
@@ -235,7 +270,7 @@ def welch_moving_average(Ybar, w):
     return np.concatenate([early, centered])
 
 
-def welch_plot(Y, windows, warmup_min, fname="welch_hw5.png"):
+def welch_plot(Y, windows, warmup_min, fname, title=""):
     n, m = Y.shape
     Ybar = Y.mean(axis=0)
     fig, axes = plt.subplots(len(windows), 1, figsize=(8, 2.2 * len(windows)), sharex=True)
@@ -248,14 +283,14 @@ def welch_plot(Y, windows, warmup_min, fname="welch_hw5.png"):
         ax.spines[["top", "right"]].set_visible(False)
     axes[0].legend(loc="lower right", frameon=False, fontsize=9)
     axes[-1].set_xlabel("minute i")
-    fig.suptitle(f"Welch plot, 1-minute avg number in system  (n = {n} pilot replications)")
+    fig.suptitle(f"Welch plot{title}, 1-minute avg number in system  (n = {n} pilot replications)")
     fig.tight_layout()
     fig.savefig(os.path.join(os.path.dirname(os.path.abspath(__file__)), fname), dpi=150)
     plt.close(fig)
     return fname
 
 
-def run_length_plot(Y, warmup_min, run_min, n_prod, fname="runlength_hw5.png", n_show=10):
+def run_length_plot(Y, warmup_min, run_min, n_prod, fname, title="", n_show=10):
     """Running average of L after the warm-up, and the 95% CI half-width n_prod replications would give."""
     n = Y.shape[0]
     X = Y[:, warmup_min:]
@@ -284,7 +319,7 @@ def run_length_plot(Y, warmup_min, run_min, n_prod, fname="runlength_hw5.png", n
         ax.spines[["top", "right"]].set_visible(False)
     ax1.legend(loc="upper right", frameon=False, fontsize=9)
     ax2.legend(loc="upper right", frameon=False, fontsize=9)
-    fig.suptitle(f"Run length  (warm-up = {warmup_min} min, n = {n} pilot replications)")
+    fig.suptitle(f"Run length{title}  (warm-up = {warmup_min} min, n = {n} pilot replications)")
     fig.tight_layout()
     fig.savefig(os.path.join(os.path.dirname(os.path.abspath(__file__)), fname), dpi=150)
     plt.close(fig)
@@ -307,55 +342,112 @@ def print_table(Y, title, ref=None):
     print()
 
 
-if __name__ == "__main__":
-    seed = 451
+def log(msg, t0):
+    print(f"[{time.time() - t0:6.0f} s] {msg}", flush=True)
 
-    # long-run flow rates from the traffic equations (sanity check for the simulation)
-    lam, rho = flow_rates()
-    lam0 = 1 / INTERARRIVAL_MEAN
-    theory = np.full(len(MEASURES), np.nan)
-    theory[4:8] = rho
-    theory[8] = 60 * lam[3] * (1 - P[3])
-    theory[9:12] = 60 * lam[:3] * np.array(P[:3])
+
+def design_and_run(pool, t0, label, p, warmup_min, run_min, welch_len, welch_windows,
+                   pilot_n, n0, pilot_seed, n0_seed, prod_seed, suffix, target_rel=0.02):
+    """Experiment design (Welch plot -> warm-up, run-length plot -> run length, pilot -> n), then
+    production runs. Returns the production output array (n x 12)."""
+    lam, rho, theory = theory_column(p)
+    print(f"===== {label}: p = {p} =====")
     print("Traffic equations: arrival rate into S1..S4 (parts/hr):", np.round(60 * lam, 4))
     print("                   utilization S1..S4:               ", np.round(rho, 4))
     print()
 
-    # ---------------- experiment design ----------------
-    warmup_min = 500      # chosen from the Welch plot
-    run_min = 5000        # chosen from the run-length plot (10x warm-up)
-    target_rel = 0.02    # want every 95% CI half-width within +/-2% of its estimate
-
-    # Step 1: pilot runs for the Welch plot and run-length plot (1-minute avg number in system)
-    pilot_n = 50
+    # Step 1: long pilot runs, 1-minute avg number in system -> Welch plot and run-length plot
     pilot_min = warmup_min + 2 * run_min
-    streams = make_streams(1000, pilot_n)
-    traces = []
-    for j in range(pilot_n):
-        tr = []
-        simulate(streams[j], 0, pilot_min, trace=tr)
-        traces.append(tr[:pilot_min])
-    Yh = np.array(traces)
-    print("saved", welch_plot(Yh[:, :3000], [1, 24, 100, 250], warmup_min))
+    log(f"{label}: {pilot_n} pilot runs of {pilot_min} min for the Welch plot ...", t0)
+    _, Yh = run_reps(pool, pilot_seed, pilot_n, p, 0, pilot_min, trace=True)
+    print("saved", welch_plot(Yh[:, :welch_len], welch_windows, warmup_min,
+                              f"welch_hw5{suffix}.png", f" ({label})"))
 
     # Step 2: pilot replications with the chosen warm-up and run length -> how many replications?
-    n0 = 20
-    streams = make_streams(2000, n0)
-    Y0 = np.array([simulate(streams[j], warmup_min, run_min) for j in range(n0)])
-    ybar0, s0, h0 = ci(Y0)
+    log(f"{label}: {n0} pilot replications ...", t0)
+    Y0 = run_reps(pool, n0_seed, n0, p, warmup_min, run_min)
+    ybar0, s0, _ = ci(Y0)
     z = stats.norm.ppf(0.975)
     n_req = np.ceil((z * s0 / (target_rel * np.abs(ybar0))) ** 2).astype(int)
-    print_table(Y0, f"Pilot: n0 = {n0}, warm-up = {warmup_min} min, run length = {run_min} min", theory)
+    print_table(Y0, f"Pilot ({label}): n0 = {n0}, warm-up = {warmup_min} min, "
+                    f"run length = {run_min} min", theory)
     print(f"Replications needed for +/-{100 * target_rel:.0f}% relative precision, n = (z s / (r ybar))^2:")
     for (name, _), nr in zip(MEASURES, n_req):
         print(f"  {name:<32}{nr:>6}")
     print()
     n = int(max(n_req.max(), n0))
-    print("saved", run_length_plot(Yh, warmup_min, run_min, n))
+    print("saved", run_length_plot(Yh, warmup_min, run_min, n, f"runlength_hw5{suffix}.png",
+                                   f" ({label})"))
     print()
 
     # Step 3: production runs with fresh seeds
-    streams = make_streams(seed, n)
-    Y = np.array([simulate(streams[j], warmup_min, run_min) for j in range(n)])
-    print_table(Y, f"Production: n = {n} replications, warm-up = {warmup_min} min, "
+    log(f"{label}: {n} production replications ...", t0)
+    Y = run_reps(pool, prod_seed, n, p, warmup_min, run_min)
+    print_table(Y, f"Production ({label}): n = {n} replications, warm-up = {warmup_min} min, "
                    f"run length = {run_min} min", theory)
+    return Y
+
+
+def paired_t(Y_base, Y_new, idx, alpha=0.05):
+    """Paired-t CI for E[new - base] on the measures in idx (rows of Y_base and Y_new are paired)."""
+    n = Y_base.shape[0]
+    D = Y_new[:, idx] - Y_base[:, idx]
+    dbar, s, h = ci(D, alpha)
+    print(f"Paired-t comparison, new - base, n = {n} pairs, {100 * (1 - alpha):.0f}% confidence "
+          f"(t_{{{n - 1}, {1 - alpha / 2}}} = {stats.t.ppf(1 - alpha / 2, n - 1):.4f})")
+    head = (f"{'Measure':<32}{'Base':>10}{'New':>10}{'Mean diff':>11}{'95% CI for diff':>26}"
+            f"{'s_D':>9}  Conclusion")
+    print(head)
+    print("-" * (len(head) + 20))
+    for j, k in enumerate(idx):
+        lo, hi = dbar[j] - h[j], dbar[j] + h[j]
+        if lo > 0:
+            concl = "new > base"
+        elif hi < 0:
+            concl = "new < base"
+        else:
+            concl = "no significant difference"
+        print(f"{MEASURES[k][0]:<32}{Y_base[:, k].mean():>10.4f}{Y_new[:, k].mean():>10.4f}"
+              f"{dbar[j]:>11.4f}   [{lo:>9.4f}, {hi:>9.4f}]{s[j]:>9.4f}  {concl}")
+    print()
+
+
+if __name__ == "__main__":
+    t0 = time.time()
+    sys.stdout.reconfigure(line_buffering=True)
+    with ProcessPoolExecutor() as pool:
+
+        # ---------------- parts (c), (d): base system ----------------
+        # Welch plot levels off within ~100-200 min, so warm-up = 500 min is a safe margin;
+        # run length = 10x warm-up.
+        BASE_WARMUP, BASE_RUN = 500, 5000
+        Y_base = design_and_run(pool, t0, "base system", P_BASE, BASE_WARMUP, BASE_RUN,
+                                welch_len=3000, welch_windows=[1, 24, 100, 250],
+                                pilot_n=50, n0=20, pilot_seed=1000, n0_seed=2000,
+                                prod_seed=451, suffix="")
+
+        # ---------------- part (e)(i), (ii): fallout probabilities reduced by 5 points ----------
+        # S2 now runs at rho ~ 0.975, so the system is much slower to reach steady state and the
+        # output is much more autocorrelated: the Welch plot levels off around minute 2000-3000,
+        # so warm-up = 5000 min is a safe margin, and run length = 50000 min (10x warm-up).
+        NEW_WARMUP, NEW_RUN = 5000, 50000
+        Y_new = design_and_run(pool, t0, "reduced fallout", P_NEW, NEW_WARMUP, NEW_RUN,
+                               welch_len=25000, welch_windows=[100, 500, 1000, 2500],
+                               pilot_n=40, n0=30, pilot_seed=1001, n0_seed=2001,
+                               prod_seed=452, suffix="_new")
+
+        # ---------------- part (e)(iii): paired-t comparison ----------------
+        # Paired-t needs the same number of replications for both systems, with replication j of
+        # each system paired. Both systems are run with the same seeds (common random numbers) and
+        # the same (longer) warm-up and run length, so replication j of each system sees the same
+        # arrivals and service times over the same time window. The longer settings are valid for
+        # the base system as well (it reaches steady state within its 500 min warm-up).
+        n_pair = max(len(Y_base), len(Y_new))
+        log(f"paired comparison: {n_pair} replications of each system (CRN) ...", t0)
+        Yp_base = run_reps(pool, 4510, n_pair, P_BASE, NEW_WARMUP, NEW_RUN)
+        Yp_new = run_reps(pool, 4510, n_pair, P_NEW, NEW_WARMUP, NEW_RUN)
+        paired_t(Yp_base, Yp_new, idx=[0, 2, 3, 8])
+        corr = [np.corrcoef(Yp_base[:, k], Yp_new[:, k])[0, 1] for k in (0, 2, 8)]
+        print("Correlation between paired outputs (L, W all, good rate):", np.round(corr, 3))
+        print("(positive correlation from CRN makes Var(D) < Var(base) + Var(new))")
+        log("done", t0)
