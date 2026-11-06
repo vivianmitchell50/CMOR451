@@ -1,3 +1,4 @@
+import os
 import heapq
 from collections import deque
 from itertools import count
@@ -249,7 +250,7 @@ def welch_plot(Y, windows, warmup_min, fname="welch_hw5.png"):
     axes[-1].set_xlabel("minute i")
     fig.suptitle(f"Welch plot, 1-minute avg number in system  (n = {n} pilot replications)")
     fig.tight_layout()
-    fig.savefig(fname, dpi=150)
+    fig.savefig(os.path.join(os.path.dirname(os.path.abspath(__file__)), fname), dpi=150)
     plt.close(fig)
     return fname
 
@@ -285,7 +286,7 @@ def run_length_plot(Y, warmup_min, run_min, n_prod, fname="runlength_hw5.png", n
     ax2.legend(loc="upper right", frameon=False, fontsize=9)
     fig.suptitle(f"Run length  (warm-up = {warmup_min} min, n = {n} pilot replications)")
     fig.tight_layout()
-    fig.savefig(fname, dpi=150)
+    fig.savefig(os.path.join(os.path.dirname(os.path.abspath(__file__)), fname), dpi=150)
     plt.close(fig)
     return fname
 

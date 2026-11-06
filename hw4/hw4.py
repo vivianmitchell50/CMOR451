@@ -1,3 +1,4 @@
+import os
 import numpy as np
 from math import factorial
 from scipy import stats
@@ -171,7 +172,7 @@ def welch_plot(W, title, tag, exact_Wq, windows):
     fig.suptitle(f"Welch plot, {title}  (n = {n} pilot replications, t = {t} customers)")
     fig.tight_layout()
     fname = f"welch_{tag}.png"
-    fig.savefig(fname, dpi=150)
+    fig.savefig(os.path.join(os.path.dirname(os.path.abspath(__file__)), fname), dpi=150)
     plt.close(fig)
     return fname
 
@@ -213,7 +214,7 @@ def run_length_plot(W, title, tag, ex, warmup, run_length, n_prod, n_show=10):
     fig.suptitle(f"Run length, {title}  (warm-up = {warmup}, n = {n} pilot replications)")
     fig.tight_layout()
     fname = f"runlength_{tag}.png"
-    fig.savefig(fname, dpi=150)
+    fig.savefig(os.path.join(os.path.dirname(os.path.abspath(__file__)), fname), dpi=150)
     plt.close(fig)
     return fname
 

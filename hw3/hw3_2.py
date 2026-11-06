@@ -1,3 +1,4 @@
+import os
 import numpy as np
 from scipy import stats
 import matplotlib
@@ -154,7 +155,7 @@ def welch_plot(r, mu, n, t, windows, seed):
     fig.suptitle(rf"Welch plot, $\rho$ = {r}  (n = {n} pilot replications, t = {t} customers)")
     fig.tight_layout()
     fname = f"welch_rho{int(100 * r):03d}.png"
-    fig.savefig(fname, dpi=150)
+    fig.savefig(os.path.join(os.path.dirname(os.path.abspath(__file__)), fname), dpi=150)
     plt.close(fig)
     return fname
 
